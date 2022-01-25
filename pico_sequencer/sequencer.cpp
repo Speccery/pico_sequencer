@@ -1,19 +1,29 @@
 
-// seqdemo.cpp
-// EP 2021-03-14 Erik edited from RGB keypad demo
+// sequencer.cpp
+// Started EP 2022-01-22 for real. Based on the Pimoroni "pico RGB keypad" board.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <memory.h>
 #include "pico/stdlib.h"
 
 #include "pico_rgb_keypad.hpp"
 
 using namespace pimoroni;
 
+// For starters, let's make the sequences 16 steps long.
+// Let's do 8 sequencer lanes, even if my proto board only has 6 outputs.
+
+const int SEQUENCES=8;
+uint16_t sequences[SEQUENCES];
+uint16_t sample_pos = 0;
+
+int active_displayed_seq = 2; // Show sequence 2
+
 PicoRGBKeypad pico_keypad;
 
-// Configure GPIO
+// Configure GPIO to drive the 74HC595 shift register.
 const uint DATA_PIN=6;
 const uint SHIFT_CLOCK_PIN=8;
 const uint LATCH_CLOCK_PIN=7;
@@ -47,6 +57,62 @@ void send_hc595(uint8_t v) {
 }
 
 
+/**
+ * @brief Return true when an eurorack clock has arrived.
+ *  or during development when 100ms has passed :)
+ * 
+ * @return true 
+ * @return false 
+ */
+bool is_eurorack_clock() {
+  static uint64_t last_time=0;
+  absolute_time_t t = get_absolute_time();
+  uint64_t now = to_us_since_boot(t);
+  if (now - last_time >= 100000 ) {
+    // It's been over 100ms, so this is our fake clock pulse. 
+    last_time = now;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @brief returns true if 100ms has passed
+ * 
+ * @return true 
+ * @return false 
+ */
+bool is_keyscan_time() {
+  static uint64_t last_time=0;
+  absolute_time_t t = get_absolute_time();
+  uint64_t now = to_us_since_boot(t);
+  if (now - last_time >= 100000 ) {
+    // It's been over 100ms, so time to check keys. 
+    last_time = now;
+    return true;
+  }
+  return false;  
+}
+
+/**
+ * @brief Update the pad leds to show the current sequence.
+ *  Also show the cursor.
+ * 
+ */
+void show_active_sequence() {
+  uint16_t lit = sequences[active_displayed_seq];
+  for(uint8_t i = 0; i < PicoRGBKeypad::NUM_PADS; i++) {
+    if((lit >> i) & 0x01) 
+      pico_keypad.illuminate(i, 0x20, 0x20, 0x00); 
+    else
+      pico_keypad.illuminate(i, 5, 5, 5);
+  }
+
+  // Show current position by overriding the step.
+  pico_keypad.illuminate(sample_pos, 0, 100, 0);  
+  pico_keypad.update();
+}
+
 int main() {
 
   pico_keypad.init();
@@ -57,76 +123,44 @@ int main() {
   sleep_ms(100);
   send_hc595(0);
 
-  uint16_t lit = 0;
-  uint16_t last_button_states = 0;
-  uint8_t colour_index = 0;
+  memset(sequences, 0, sizeof(sequences));
 
-  uint8_t cursor = 0;   // Erik - my cursor, run through all 16 buttons
-  uint8_t cursor_flash = 0;
+  uint16_t last_button_states = 0;
 
   while(true) {
+    // If eurorack clock pulse, forward the clock and process the sequences.
+    if(is_eurorack_clock()) {
+      uint8_t out=0;
+      for(int i=0; i<SEQUENCES; i++) {
+        if(sequences[i] & (1 << sample_pos)) {
+          // this step is active.
+          out |= 1 << i;
+        }
+      }
+      if(++sample_pos >= 16)
+        sample_pos = 0;
+      send_hc595(out);
+
+      // Update the display.
+      show_active_sequence();
+    } 
+
+    if(!is_keyscan_time())
+      continue;
+
     // read button states from i2c expander
     uint16_t button_states = pico_keypad.get_button_states();
 
     if(last_button_states != button_states && button_states) {
+      //uint8_t button = 0;
+      for(uint8_t u = 0; u < pico_keypad.NUM_PADS; u++) {
+        // Check if a button is pressed. If so, toggle the step state.
+        if((button_states & (1 << u)) && !(last_button_states & (1 << u))) {
+          sequences[active_displayed_seq] ^= 1 << u;
+        }
+      }
       last_button_states = button_states;
-      if(button_states) {
-        if(lit == 0xffff) {
-          // all buttons are already lit, reset the test
-          lit = 0;
-          colour_index++;
-          if(colour_index >= 6) {
-            colour_index = 0;
-          }
-        }else{
-          uint8_t button = 0;
-          for(uint8_t find = 0; find < pico_keypad.NUM_PADS; find++) {
-            // check if this button is pressed and no other buttons are pressed
-            if(button_states & 0x01) {
-              if(!(button_states & (~0x01))) {
-                lit |= 1 << button;
-              }
-              break;
-            }
-            button_states >>= 1;
-            button++;
-          }
-        }
-      }
     }
-    send_hc595( lit  & 0xFF);
-
-    last_button_states = button_states;
-
-    for(uint8_t i = 0; i < PicoRGBKeypad::NUM_PADS; i++) {
-      if((lit >> i) & 0x01) {
-        switch(colour_index)
-        {
-          case 0: pico_keypad.illuminate(i, 0x00, 0x20, 0x00);  break;
-          case 1: pico_keypad.illuminate(i, 0x20, 0x20, 0x00);  break;
-          case 2: pico_keypad.illuminate(i, 0x20, 0x00, 0x00);  break;
-          case 3: pico_keypad.illuminate(i, 0x20, 0x00, 0x20);  break;
-          case 4: pico_keypad.illuminate(i, 0x00, 0x00, 0x20);  break;
-          case 5: pico_keypad.illuminate(i, 0x00, 0x20, 0x20);  break;
-        }
-      } else {
-        pico_keypad.illuminate(i, 0x05, 0x05, 0x05);
-      }
-    }
-
-    // Show my cursor: Flash the cursor key in two different colors depending on cursor_flash.
-    // uint8_t k = cursor_flash ? 255 : 0;
-    pico_keypad.illuminate(cursor, 0, cursor_flash ? 255 : 100, 0);
-
-    pico_keypad.update();
-
-    sleep_ms(100);
-    if(cursor_flash) {
-      if(++cursor == PicoRGBKeypad::NUM_PADS) {
-        cursor = 0;
-      }
-    }
-    cursor_flash ^= 1;
   }
 
   return 0;
